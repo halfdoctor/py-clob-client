@@ -1,14 +1,16 @@
 #!/usr/bin/env python3
 """
 Cricket Odds Fetcher for Polymarket
-This script finds all active cricket markets and displays their details,
-with optional search functionality to filter specific matches
+This script finds cricket markets where the match has already started (gameStartTime > current UTC time)
+and displays their details, with optional search functionality to filter specific matches
 """
 
 import sys
 import os
 import json
 import requests
+import datetime
+from datetime import timezone
 from dotenv import load_dotenv
 from py_clob_client.client import ClobClient
 from py_clob_client.constants import POLYGON
@@ -119,9 +121,15 @@ def search_cricket_markets():
         if all_markets and DEBUG:
             debug_print("Sample market structure:", all_markets[0])
         
-        # Remove duplicates and filter for active markets
+        # Get current UTC time for filtering
+        current_utc_time = datetime.datetime.now(timezone.utc)
+        debug_print(f"Current UTC time: {current_utc_time.isoformat()}")
+        
+        # Remove duplicates and filter for active markets with gameStartTime > current time
         seen_ids = set()
         unique_markets = []
+        started_matches = []
+        
         for market in all_markets:
             market_id = market.get("id")
             
@@ -131,17 +139,58 @@ def search_cricket_markets():
                 
             seen_ids.add(market_id)
             
-            # Check if market is active - be lenient with criteria
+            # Check if market is active
             is_active = True
             if market.get("closed") == True:
                 is_active = False
             
             # Include the market if it's active
             if is_active:
-                unique_markets.append(market)
-                
-        debug_print(f"Unique active markets after filtering: {len(unique_markets)}")
-        return unique_markets
+                # Fetch more detailed info for each market to get gameStartTime
+                try:
+                    gamma_url = f"https://gamma-api.polymarket.com/markets/{market_id}"
+                    response = requests.get(gamma_url)
+                    
+                    if response.status_code == 200:
+                        market_details = response.json()
+                        
+                        # Add or update market with details
+                        for key, value in market_details.items():
+                            market[key] = value
+                        
+                        # Check if gameStartTime exists and is before current time
+                        game_start_time = market.get("gameStartTime")
+                        if game_start_time:
+                            try:
+                                # Parse ISO format datetime
+                                start_time = datetime.datetime.fromisoformat(game_start_time.replace('Z', '+00:00'))
+                                
+                                # Compare with current UTC time
+                                if start_time >= current_utc_time:
+                                    started_matches.append(market)
+                                    debug_print(f"Match started at {start_time}, adding to results")
+                                else:
+                                    debug_print(f"Match starts at {start_time}, which is in the past")
+                            except ValueError:
+                                debug_print(f"Could not parse gameStartTime: {game_start_time}")
+                                # Add to general active markets if we can't parse time
+                                unique_markets.append(market)
+                        else:
+                            # If no gameStartTime, add to general active markets
+                            unique_markets.append(market)
+                except Exception as e:
+                    debug_print(f"Error fetching details for market {market_id}: {e}")
+                    # Add to general active markets if we can't get details
+                    unique_markets.append(market)
+        
+        # Combine started matches with unique markets that didn't have gameStartTime
+        # but prioritize the started matches in the final list
+        final_markets = started_matches + [m for m in unique_markets if m["id"] not in [sm["id"] for sm in started_matches]]
+        
+        debug_print(f"Markets with started matches: {len(started_matches)}")
+        debug_print(f"Total unique active markets: {len(final_markets)}")
+        
+        return final_markets
         
     except Exception as e:
         print(f"Error searching for cricket markets: {e}")
@@ -197,6 +246,28 @@ def get_market_summary(market):
         summary = f"Market: {market['question']}\n"
         summary += f"Market ID: {market['id']}\n"
         
+        # Check and display game start time
+        if "gameStartTime" in market and market["gameStartTime"]:
+            try:
+                # Parse ISO format datetime
+                start_time = datetime.datetime.fromisoformat(market["gameStartTime"].replace('Z', '+00:00'))
+                current_time = datetime.datetime.now(timezone.utc)
+                time_diff = current_time - start_time
+                
+                # Calculate hours and minutes elapsed
+                hours_elapsed = time_diff.total_seconds() / 3600
+                
+                if hours_elapsed < 0:
+                    summary += f"Game Start Time: {market['gameStartTime']} (Hasn't started yet)\n"
+                else:
+                    if hours_elapsed < 1:
+                        minutes_elapsed = int(time_diff.total_seconds() / 60)
+                        summary += f"Game Start Time: {market['gameStartTime']} (Started {minutes_elapsed} minutes ago)\n"
+                    else:
+                        summary += f"Game Start Time: {market['gameStartTime']} (Started {hours_elapsed:.1f} hours ago)\n"
+            except ValueError:
+                summary += f"Game Start Time: {market['gameStartTime']}\n"
+        
         # Parse outcomes and prices from the market data
         outcomes = []
         outcome_prices = []
@@ -229,51 +300,27 @@ def get_market_summary(market):
         else:
             summary += "Current probability: Not available\n"
         
-        # Try to get more market details via Gamma API
-        try:
-            gamma_url = f"https://gamma-api.polymarket.com/markets/{market['id']}"
-            response = requests.get(gamma_url)
-            
-            if response.status_code == 200:
-                market_details = response.json()
-                
-                if "volume" in market_details and market_details["volume"]:
-                    summary += f"Volume: ${float(market_details['volume']):.2f}\n"
-                
-                if "liquidity" in market_details and market_details["liquidity"]:
-                    summary += f"Liquidity: ${float(market_details['liquidity']):.2f}\n"
-                
-                if "startDate" in market_details and market_details["startDate"]:
-                    summary += f"Start Date: {market_details['startDate']}\n"
-                
-                if "endDate" in market_details and market_details["endDate"]:
-                    summary += f"End Date: {market_details['endDate']}\n"
-                    
-                if "gameStartTime" in market_details and market_details["gameStartTime"]:
-                    summary += f"Game Start Time: {market_details['gameStartTime']}\n"
-        except Exception as e:
-            print(f"Error getting additional market details: {e}")
-            
-            # Fallback to data in the original market object
-            if "volume" in market and market["volume"]:
-                try:
-                    volume = float(market["volume"])
-                    summary += f"Volume: ${volume:.2f}\n"
-                except:
-                    pass
-            
-            if "liquidity" in market and market["liquidity"]:
-                try:
-                    liquidity = float(market["liquidity"])
-                    summary += f"Liquidity: ${liquidity:.2f}\n"
-                except:
-                    pass
-            
-            if "startDate" in market and market["startDate"]:
-                summary += f"Start Date: {market['startDate']}\n"
-            
-            if "endDate" in market and market["endDate"]:
-                summary += f"End Date: {market['endDate']}\n"
+        # Market dates
+        if "startDate" in market and market["startDate"]:
+            summary += f"Market Start Date: {market['startDate']}\n"
+        
+        if "endDate" in market and market["endDate"]:
+            summary += f"Market End Date: {market['endDate']}\n"
+        
+        # Market stats
+        if "volume" in market and market["volume"]:
+            try:
+                volume = float(market["volume"])
+                summary += f"Volume: ${volume:.2f}\n"
+            except:
+                pass
+        
+        if "liquidity" in market and market["liquidity"]:
+            try:
+                liquidity = float(market["liquidity"])
+                summary += f"Liquidity: ${liquidity:.2f}\n"
+            except:
+                pass
         
         # Add Polymarket link
         event_slug = market.get('eventSlug', '')
@@ -294,15 +341,20 @@ def main():
         search_term = sys.argv[2]
         print(f"Searching for: {search_term}")
     
+    # Get current UTC time and display it
+    current_utc_time = datetime.datetime.now(timezone.utc)
+    print(f"Current UTC time: {current_utc_time.strftime('%Y-%m-%d %H:%M:%S UTC')}")
+    
     # Search for all active cricket markets
     print("Searching for cricket markets. This may take a moment...")
     cricket_markets = search_cricket_markets()
     
     if not cricket_markets:
-        print("No cricket markets found. Make sure Polymarket has active cricket markets available.")
+        print("No cricket markets found where the match has already started.")
+        print("There may be no active cricket matches currently in progress.")
         return
     
-    print(f"Found {len(cricket_markets)} active cricket markets.")
+    print(f"Found {len(cricket_markets)} cricket markets where matches have started or may be in progress.")
     
     # Filter markets if a search term was provided
     if search_term:
@@ -314,14 +366,22 @@ def main():
     else:
         matching_markets = cricket_markets
     
-    # Sort markets by end date (if available)
+    # Sort markets by gameStartTime (most recently started first)
     try:
-        matching_markets.sort(key=lambda x: x.get("endDate", "9999-12-31"))
-    except Exception:
-        pass  # If sorting fails, keep original order
+        def get_start_time(market):
+            game_start = market.get("gameStartTime", "9999-12-31T00:00:00Z")
+            try:
+                return datetime.datetime.fromisoformat(game_start.replace('Z', '+00:00'))
+            except:
+                return datetime.datetime.max
+        
+        matching_markets.sort(key=get_start_time, reverse=True)
+    except Exception as e:
+        print(f"Error sorting markets: {e}")
+        # If sorting fails, keep original order
     
     # Print market summaries
-    print("\n=== ACTIVE CRICKET MARKETS ===\n")
+    print("\n=== ACTIVE CRICKET MARKETS WITH MATCHES TO START ===\n")
     for i, market in enumerate(matching_markets):
         print(f"--- Market {i+1} of {len(matching_markets)} ---")
         print(get_market_summary(market))
@@ -354,24 +414,30 @@ def main():
             selected_market = matching_markets[selected_idx]
             print(f"\n=== DETAILED MARKET INFORMATION: {selected_market['question']} ===\n")
             
-            # Try to get more market details via Gamma API
-            try:
-                gamma_url = f"https://gamma-api.polymarket.com/markets/{selected_market['id']}"
-                response = requests.get(gamma_url)
-                
-                if response.status_code == 200:
-                    market_details = response.json()
-                    debug_print("Detailed market data:", market_details)
-                    # Use the more detailed market data
-                    selected_market = market_details
-            except Exception as e:
-                print(f"Note: Could not get additional market details: {e}")
-            
             # Display comprehensive information about the market
             print(f"Market ID: {selected_market['id']}")
             token_id = extract_token_id(selected_market)
             if token_id:
                 print(f"Token ID: {token_id}")
+            
+            # Display game start time with time elapsed
+            if "gameStartTime" in selected_market and selected_market["gameStartTime"]:
+                try:
+                    # Parse ISO format datetime
+                    start_time = datetime.datetime.fromisoformat(selected_market["gameStartTime"].replace('Z', '+00:00'))
+                    current_time = datetime.datetime.now(timezone.utc)
+                    time_diff = current_time - start_time
+                    
+                    print(f"Game Start Time: {selected_market['gameStartTime']}")
+                    
+                    # Calculate hours and minutes elapsed
+                    hours_elapsed = time_diff.total_seconds() / 3600
+                    if hours_elapsed < 0:
+                        print(f"Match hasn't started yet. Starts in {abs(hours_elapsed):.1f} hours")
+                    else:
+                        print(f"Match in progress. Started {hours_elapsed:.1f} hours ago")
+                except ValueError:
+                    print(f"Game Start Time: {selected_market['gameStartTime']}")
             
             # Parse outcomes and prices
             outcomes = []
@@ -403,11 +469,9 @@ def main():
             
             # Market dates
             if "startDate" in selected_market and selected_market["startDate"]:
-                print(f"\nStart Date: {selected_market['startDate']}")
+                print(f"\nMarket Start Date: {selected_market['startDate']}")
             if "endDate" in selected_market and selected_market["endDate"]:
-                print(f"End Date: {selected_market['endDate']}")
-            if "gameStartTime" in selected_market and selected_market["gameStartTime"]:
-                print(f"Game Start Time: {selected_market['gameStartTime']}")
+                print(f"Market End Date: {selected_market['endDate']}")
             
             # Market status
             status = []
@@ -475,4 +539,5 @@ def main():
 if __name__ == "__main__":
     print("Cricket Odds Fetcher for Polymarket")
     print("-----------------------------------")
+    print("Filtering for matches that have already started (gameStartTime > current UTC time)")
     main()
