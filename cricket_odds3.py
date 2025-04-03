@@ -1,19 +1,33 @@
 #!/usr/bin/env python3
 """
-Improved Cricket Odds Fetcher with Market Slug Search
-This script uses the Polymarket CLOB client library to search for cricket markets
-and displays detailed information about odds.
+Improved Cricket Odds Fetcher for Polymarket
+This script directly accesses the Gamma API to find cricket markets and display odds,
+with fallback methods when orderbook is not available
 """
 
 import sys
 import os
-import re
+import json
+import requests
 from dotenv import load_dotenv
 from py_clob_client.client import ClobClient
 from py_clob_client.constants import POLYGON
 
 # Load environment variables from .env file
 load_dotenv()
+
+# Set to True for detailed logging
+DEBUG = True
+
+def debug_print(message, obj=None):
+    """Print debug information if DEBUG is True"""
+    if DEBUG:
+        print(f"DEBUG: {message}")
+        if obj is not None:
+            if isinstance(obj, dict) or isinstance(obj, list):
+                print(json.dumps(obj, indent=2))
+            else:
+                print(obj)
 
 def get_clob_client():
     """Initialize and return a CLOB client with API credentials."""
@@ -32,456 +46,324 @@ def get_clob_client():
             api_passphrase=os.getenv("CLOB_PASS_PHRASE"),
         )
         client.set_api_creds(creds)
+        print("API credentials set")
+    else:
+        print("No API credentials found, running in read-only mode")
     
     return client
 
-def extract_slug_from_url(url):
-    """Extract the market slug from a Polymarket URL."""
-    # Extract event name from path
-    event_match = re.search(r'/event/([^/?]+)', url)
-    if event_match:
-        return event_match.group(1)
-        
-    return None
-
-def normalize_team_name(name):
-    """Normalize team names by removing common suffixes and converting to lowercase."""
-    if not name:
-        return ""
-    
-    name = name.lower()
-    
-    # Remove common suffixes
-    suffixes = [" kings", " super kings", " royals", " indians", " capitals", 
-                " knight riders", " titans", " super giants", " sunrisers"]
-    for suffix in suffixes:
-        if name.endswith(suffix):
-            name = name.replace(suffix, "")
-            break
-    
-    return name.strip()
-
-def list_all_cricket_markets(client, search_term=None):
-    """List all markets matching cricket or the search term, showing slug and question."""
-    print("\nSearching for cricket markets...")
-    all_markets = []
-
-    # Define team mappings with more variations
-    team_mappings = {
-        "rcb": ["royal challengers", "bangalore", "rcb", "royal challengers bangalore"],
-        "gt": ["gujarat", "titans", "gt", "gujarat titans"],
-        "mi": ["mumbai", "indians", "mi", "mumbai indians"],
-        "csk": ["chennai", "super kings", "csk", "chennai super kings"],
-        "srh": ["sunrisers", "hyderabad", "srh", "sunrisers hyderabad"],
-        "kkr": ["kolkata", "knight riders", "kkr", "kolkata knight riders"],
-        "rr": ["rajasthan", "royals", "rr", "rajasthan royals"],
-        "pbks": ["punjab", "kings", "pbks", "punjab kings"],
-        "dc": ["delhi", "capitals", "dc", "delhi capitals"],
-        "lsg": ["lucknow", "super giants", "lsg", "lucknow super giants"]
-    }
-    
+def search_cricket_markets():
+    """Search for cricket markets directly using the Gamma API"""
+    # First find any cricket market to use as a reference
     try:
-        # First try to get simplified markets
-        print("Fetching simplified markets...")
-        markets_response = client.get_simplified_markets()
+        print("Searching for cricket markets...")
         
-        # Debug the response structure
-        print(f"\nAPI Response Type: {type(markets_response)}")
+        # We'll search a few known cricket market IDs and use them to find related markets
+        # These are reference IDs for cricket markets
+        reference_ids = ["531894", "531899", "531895", "531896"]
+        all_markets = []
         
-        # Process the response based on its structure
-        if isinstance(markets_response, dict) and "data" in markets_response:
-            markets_data = markets_response["data"]
-            print(f"Found {len(markets_data)} markets in 'data' field")
-            all_markets.extend(markets_data)
-        elif isinstance(markets_response, list):
-            print(f"Found {len(markets_response)} markets in response list")
-            all_markets.extend(markets_response)
-        else:
-            print("Unexpected response format, trying to extract data...")
-            if isinstance(markets_response, dict):
-                for key, value in markets_response.items():
-                    if isinstance(value, list) and len(value) > 0:
-                        print(f"Found potential market data in key: {key} with {len(value)} items")
-                        all_markets.extend(value)
-
+        for market_id in reference_ids:
+            try:
+                # Try to get related markets for this cricket market
+                gamma_url = f"https://gamma-api.polymarket.com/markets/{market_id}/related-markets"
+                params = {
+                    "limit": 20,      # Get more related markets
+                    "offset": 0,
+                    "closed": "false"  # Only active markets
+                }
+                
+                response = requests.get(gamma_url, params=params)
+                
+                if response.status_code == 200:
+                    markets = response.json()
+                    print(f"Found {len(markets)} cricket markets related to ID {market_id}")
+                    all_markets.extend(markets)
+                    
+                    # If we found markets, we can stop searching
+                    if len(markets) > 0:
+                        break
+                else:
+                    print(f"Error with market ID {market_id}: Status {response.status_code}")
+            except Exception as e:
+                print(f"Error with market ID {market_id}: {e}")
+                continue
+        
+        # If we didn't find any markets with related-markets, try direct API call
+        if not all_markets:
+            # Try direct request to all markets with filters for cricket
+            print("Trying direct search...")
+            gamma_url = "https://gamma-api.polymarket.com/markets"
+            params = {"limit": 100}
+            
+            response = requests.get(gamma_url, params=params)
+            
+            if response.status_code == 200:
+                markets = response.json()
+                
+                # Filter for cricket matches (look for team names)
+                cricket_markets = []
+                cricket_keywords = ["vs", "knight riders", "super kings", "capitals", 
+                                   "indians", "royals", "sunrisers", "kings", "titans", 
+                                   "super giants", "ipl", "cricket"]
+                
+                for market in markets:
+                    market_text = " ".join([
+                        str(market.get("question", "")),
+                        str(market.get("slug", "")),
+                        str(market.get("eventSlug", ""))
+                    ]).lower()
+                    
+                    if any(keyword in market_text for keyword in cricket_keywords):
+                        cricket_markets.append(market)
+                
+                all_markets.extend(cricket_markets)
+                print(f"Found {len(cricket_markets)} cricket markets through direct search")
+        
+        # Remove duplicates
+        seen_ids = set()
+        unique_markets = []
+        for market in all_markets:
+            if market["id"] not in seen_ids:
+                seen_ids.add(market["id"])
+                unique_markets.append(market)
+        
+        return unique_markets
+        
     except Exception as e:
-        print(f"Error fetching markets: {str(e)}")
+        print(f"Error searching for cricket markets: {e}")
         return []
 
-    # Log the structure of the first item to understand the response format
-    if all_markets and len(all_markets) > 0:
-        sample = all_markets[0]
-        print("\nSample market structure:")
-        for key in sorted(sample.keys()):
-            print(f"  {key}: {type(sample.get(key))}")
-        
-        # Print first few markets for debugging
-        print("\nFirst few markets:")
-        for i, market in enumerate(all_markets[:3]):
-            if isinstance(market, dict):
-                print(f"Market {i+1}:")
-                for key in ['question', 'slug', 'eventSlug', 'conditionId']:
-                    if key in market:
-                        print(f"  {key}: {market.get(key)}")
-    else:
-        print("No markets found in the response")
-        return []
-
-    # Filter for cricket markets with improved logic
-    cricket_markets = []
-    cricket_terms = ["ipl", "cricket", "t20", "vs.", "vs", "match"]
-    
-    for market in all_markets:
-        if not isinstance(market, dict):
-            continue
-            
-        # Extract and normalize fields
-        market_data = {
-            'id': str(market.get('id', '')),
-            'conditionId': str(market.get('conditionId', '')),
-            'slug': str(market.get('slug', '')).lower(),
-            'eventSlug': str(market.get('eventSlug', '')).lower(),
-            'question': str(market.get('question', '')).lower(),
-            'description': str(market.get('description', '')).lower(),
-            'outcomes': market.get('outcomes', '[]')
-        }
-        
-        # Check if it's a cricket market based on content
-        is_cricket = False
-        
-        # Check for cricket terms
-        if any(term in value for term in cricket_terms for value in market_data.values() if isinstance(value, str)):
-            is_cricket = True
-        
-        # Check for team names
-        all_team_terms = [term.lower() for terms in team_mappings.values() for term in terms]
-        has_teams = any(team in value for team in all_team_terms for value in market_data.values() if isinstance(value, str))
-        
-        # Check if it's a match between two teams (contains 'vs' or 'vs.')
-        vs_pattern = r'\b(vs\.?|versus)\b'
-        has_vs = any(re.search(vs_pattern, value) for value in market_data.values() if isinstance(value, str))
-        
-        if is_cricket or (has_teams and has_vs):
-            cricket_markets.append(market)
-            print(f"\nFound cricket market: {market.get('question', 'N/A')}")
-    
-    print(f"\nFound {len(cricket_markets)} cricket-related markets")
-    
-    # Now search within cricket markets with improved matching
+def find_match(markets, search_term):
+    """Find a specific match from the list of markets"""
+    search_term = search_term.lower()
     matching_markets = []
-    if search_term:
-        search_term = search_term.lower()
-        print(f"Searching for term: {search_term}")
+    
+    for market in markets:
+        market_text = " ".join([
+            str(market.get("question", "")),
+            str(market.get("slug", "")),
+            str(market.get("eventSlug", ""))
+        ]).lower()
         
-        # Handle "vs" format
-        if " vs " in search_term or " vs. " in search_term:
-            # Extract team names
-            parts = re.split(r'\s+vs\.?\s+', search_term)
-            team1, team2 = [normalize_team_name(part) for part in parts]
-            print(f"Looking for match between: {team1} and {team2}")
+        # Check for matches
+        if search_term in market_text:
+            matching_markets.append(market)
+        
+        # If search term has "vs", check individual team names
+        if " vs " in search_term:
+            teams = search_term.split(" vs ")
+            team1 = teams[0].strip()
+            team2 = teams[1].strip()
             
-            # Find markets that have both teams
-            for market in cricket_markets:
-                market_text = " ".join([
-                    str(market.get("slug", "")),
-                    str(market.get("question", "")),
-                    str(market.get("eventSlug", "")),
-                    str(market.get("description", ""))
-                ]).lower()
-                
-                # Check if both teams are present
-                if team1 in market_text and team2 in market_text:
-                    matching_markets.append({
-                        "market_id": market.get("conditionId"),
-                        "market_slug": market.get("slug") or market.get("eventSlug"),
-                        "question": market.get("question"),
-                        "token_id": extract_token_id(market)
-                    })
-                    print(f"Found match: {market.get('question')}")
-        else:
-            # Handle single team or keyword search
-            search_parts = search_term.split()
-            
-            for market in cricket_markets:
-                market_text = " ".join([
-                    str(market.get("slug", "")),
-                    str(market.get("question", "")),
-                    str(market.get("eventSlug", "")),
-                    str(market.get("description", ""))
-                ]).lower()
-                
-                # Check if all search parts are in the market text
-                if all(part in market_text for part in search_parts):
-                    matching_markets.append({
-                        "market_id": market.get("conditionId"),
-                        "market_slug": market.get("slug") or market.get("eventSlug"),
-                        "question": market.get("question"),
-                        "token_id": extract_token_id(market)
-                    })
-                    print(f"Found match: {market.get('question')}")
+            if team1 in market_text and team2 in market_text:
+                if market not in matching_markets:
+                    matching_markets.append(market)
     
     return matching_markets
 
 def extract_token_id(market):
-    """Extract token ID from a market object with improved handling."""
-    # Try multiple approaches to extract token IDs
-    if "tokenIds" in market and market["tokenIds"]:
-        if isinstance(market["tokenIds"], list) and len(market["tokenIds"]) > 0:
-            return market["tokenIds"][0]
+    """Extract token ID from a market"""
+    token_id = None
     
-    if "token_ids" in market and market["token_ids"]:
-        if isinstance(market["token_ids"], list) and len(market["token_ids"]) > 0:
-            return market["token_ids"][0]
+    # Get the condition ID
+    if "conditionId" in market:
+        return market["conditionId"]
     
-    if "outcome_token_ids" in market:
-        outcomes = market["outcome_token_ids"]
-        if isinstance(outcomes, list) and len(outcomes) > 0:
-            if all(isinstance(item, dict) for item in outcomes):
-                return outcomes[0].get("id")
-            else:
-                return outcomes[0]
-        elif isinstance(outcomes, dict):
-            return outcomes.get("id")
-    
-    # For YES tokens, often token ID is directly available
-    if "tokenId" in market:
-        return market["tokenId"]
-    
-    # Use condition ID as fallback
-    return market.get("conditionId")
+    return token_id
 
-def search_by_market_slug(client, search_term_or_url):
-    """Search for markets where the slug contains the search term."""
-    # Check if input is a URL
-    if search_term_or_url.startswith("http"):
-        print("URL detected, extracting slug...")
-        search_term = extract_slug_from_url(search_term_or_url)
-        if not search_term:
-            print("Could not extract slug from URL. Using full URL as search term.")
-            search_term = search_term_or_url
-    else:
-        search_term = search_term_or_url
-    
-    print(f"Searching for market with term: {search_term}")
-    
-    # Get all markets matching the search term
-    matching_markets = list_all_cricket_markets(client, search_term)
-    
-    return matching_markets
-
-def get_market_odds(client, market):
-    """Get the current odds for a specific market."""
-    print(f"Getting odds for market: {market['market_id']}")
-    print(f"Market slug: {market['market_slug']}")
-    print(f"Using token ID: {market['token_id']}")
-    
-    token_id = market["token_id"]
+def get_market_details(client, market):
+    """Get market details - provides data even when orderbook isn't available"""
+    token_id = extract_token_id(market)
     if not token_id:
         return "No token ID available for this market"
     
     try:
-        # Try to get order book for the market
-        try:
-            order_book = client.get_order_book(token_id)
-        except Exception as e:
-            print(f"Error getting order book: {str(e)}")
-            return f"Could not get order book: {str(e)}"
-        
-        if not order_book:
-            return "No orderbook found for this market"
-        
-        # Try to get mid-point price
-        midpoint = None
-        try:
-            midpoint = client.get_midpoint(token_id)
-        except Exception as e:
-            print(f"Couldn't get midpoint: {str(e)}")
-            # Calculate midpoint manually if API call fails
-            if hasattr(order_book, 'bids') and order_book.bids and hasattr(order_book, 'asks') and order_book.asks:
-                best_bid = float(order_book.bids[0].price)
-                best_ask = float(order_book.asks[0].price)
-                midpoint = {"mid": (best_bid + best_ask) / 2}
-                print(f"Calculated midpoint manually: {midpoint['mid']}")
-        
         # Format the output
-        formatted_output = f"Market Question: {market['question']}\n"
-        formatted_output += f"Market Slug: {market['market_slug']}\n"
-        formatted_output += f"Market ID: {market['market_id']}\n"
-        formatted_output += f"Token ID: {market['token_id']}\n\n"
+        formatted_output = f"Market: {market['question']}\n"
+        formatted_output += f"Market ID: {market['id']}\n"
+        formatted_output += f"Token ID: {token_id}\n\n"
         
-        if midpoint and "mid" in midpoint:
-            probability = float(midpoint["mid"]) * 100
-            formatted_output += f"Current probability: {probability:.2f}%\n\n"
+        # Parse outcomes and prices from the market data
+        outcomes = []
+        outcome_prices = []
+        
+        if "outcomes" in market:
+            try:
+                outcomes = json.loads(market["outcomes"])
+            except:
+                outcomes = []
+        
+        if "outcomePrices" in market:
+            try:
+                outcome_prices = json.loads(market["outcomePrices"])
+            except:
+                outcome_prices = []
+        
+        # Add outcomes if available
+        if outcomes and outcome_prices:
+            formatted_output += "Current probabilities:\n"
+            for i, outcome in enumerate(outcomes):
+                if i < len(outcome_prices):
+                    price = float(outcome_prices[i])
+                    formatted_output += f"  {outcome}: {price * 100:.2f}%\n"
+            formatted_output += "\n"
         else:
             formatted_output += "Current probability: Not available\n\n"
         
-        # Add bid and ask information
-        if hasattr(order_book, 'bids') and order_book.bids:
-            formatted_output += "Top bids (BUY orders):\n"
-            for i, bid in enumerate(order_book.bids[:5]):  # Show top 5 bids
-                formatted_output += f"  Price: ${bid.price} | Size: {bid.size}\n"
-        else:
-            formatted_output += "No bid orders found.\n"
+        # Try to get more market details via Gamma API
+        try:
+            gamma_url = f"https://gamma-api.polymarket.com/markets/{market['id']}"
+            response = requests.get(gamma_url)
+            
+            if response.status_code == 200:
+                market_details = response.json()
+                
+                if "volume" in market_details and market_details["volume"]:
+                    formatted_output += f"Volume: ${float(market_details['volume']):.2f}\n"
+                
+                if "liquidity" in market_details and market_details["liquidity"]:
+                    formatted_output += f"Liquidity: ${float(market_details['liquidity']):.2f}\n"
+                
+                if "startDate" in market_details and market_details["startDate"]:
+                    formatted_output += f"Start Date: {market_details['startDate']}\n"
+                
+                if "endDate" in market_details and market_details["endDate"]:
+                    formatted_output += f"End Date: {market_details['endDate']}\n"
+                
+                formatted_output += "\n"
+        except Exception as e:
+            print(f"Error getting market details: {e}")
         
-        if hasattr(order_book, 'asks') and order_book.asks:
-            formatted_output += "\nTop asks (SELL orders):\n"
-            for i, ask in enumerate(order_book.asks[:5]):  # Show top 5 asks
-                formatted_output += f"  Price: ${ask.price} | Size: {ask.size}\n"
-        else:
-            formatted_output += "\nNo ask orders found.\n"
+        # Try to get order book - but this part might fail if no orders exist
+        try:
+            order_book = client.get_order_book(token_id)
+            
+            if order_book:
+                # Add bid and ask information
+                if hasattr(order_book, 'bids') and order_book.bids:
+                    formatted_output += "Top bids (BUY orders):\n"
+                    for i, bid in enumerate(order_book.bids[:5]):
+                        formatted_output += f"  Price: ${bid.price} | Size: {bid.size}\n"
+                else:
+                    formatted_output += "No bid orders found.\n"
+                
+                if hasattr(order_book, 'asks') and order_book.asks:
+                    formatted_output += "\nTop asks (SELL orders):\n"
+                    for i, ask in enumerate(order_book.asks[:5]):
+                        formatted_output += f"  Price: ${ask.price} | Size: {ask.size}\n"
+                else:
+                    formatted_output += "\nNo ask orders found.\n"
+            else:
+                formatted_output += "No order book data available (market may be new or inactive).\n"
+                formatted_output += "Check Polymarket website for trading:\n"
+                formatted_output += f"https://polymarket.com/event/{market.get('eventSlug', '')}\n"
+        except Exception as e:
+            formatted_output += "\nOrder book not available for this market.\n"
+            formatted_output += "This could be because:\n"
+            formatted_output += "1. The market is new and has no active orders yet\n"
+            formatted_output += "2. Trading hasn't started for this match\n"
+            formatted_output += "3. The API format has changed\n\n"
+            formatted_output += "Check Polymarket website for trading:\n"
+            formatted_output += f"https://polymarket.com/event/{market.get('eventSlug', '')}\n"
+        
+        # Add trading advice
+        formatted_output += "\n---\n"
+        formatted_output += "To trade on this market:\n"
+        formatted_output += "1. Visit Polymarket.com and search for this match\n"
+        formatted_output += "2. Or use the token ID with py-clob-client when trading becomes available\n"
         
         return formatted_output
     except Exception as e:
-        return f"Error getting odds: {str(e)}"
-
-def read_matches_from_file(filename):
-    """Read match search terms or URLs from a file."""
-    try:
-        with open(filename, 'r') as file:
-            return [line.strip() for line in file if line.strip()]
-    except FileNotFoundError:
-        print(f"Error: File {filename} not found.")
-        return []
+        return f"Error getting market details: {str(e)}"
 
 def main():
-    """Script entry point."""
+    """Script entry point"""
     # Check command line arguments
     if len(sys.argv) < 2:
-        print("Usage: python slug_search.py search_terms.txt [term_number]")
-        print("       python slug_search.py --search \"search term\"")
+        print("Usage: python cricket_odds.py --search \"team1 vs team2\"")
         return
     
-    # Check for direct search mode
+    # Direct search mode
     if sys.argv[1] == "--search" and len(sys.argv) >= 3:
         search_term = sys.argv[2]
-        print(f"Direct search mode: {search_term}")
+        print(f"Searching for: {search_term}")
         
-        # Initialize the CLOB client
-        client = get_clob_client()
+        # Search for cricket markets
+        print("Searching for cricket markets. This may take a moment...")
+        cricket_markets = search_cricket_markets()
         
-        # Search for markets
-        markets = search_by_market_slug(client, search_term)
+        if not cricket_markets:
+            print("No cricket markets found.")
+            return
         
-        if not markets:
-            print(f"No markets found for: {search_term}")
+        print(f"Found {len(cricket_markets)} cricket markets.")
+        
+        # Find the specific match
+        matching_markets = find_match(cricket_markets, search_term)
+        
+        if not matching_markets:
+            print(f"No markets found matching: {search_term}")
+            
+            # Show all available markets as a hint
+            print("\nAvailable cricket markets:")
+            for i, market in enumerate(cricket_markets):
+                print(f"{i+1}. {market['question']}")
+            
+            # Offer alternative search suggestions
+            if " vs " in search_term:
+                teams = search_term.lower().split(" vs ")
+                print(f"\nTry these alternative searches:")
+                print(f"- python cricket_odds.py --search \"{teams[1]} vs {teams[0]}\"")  # Reverse order
+                
             return
         
         # Print found markets
-        print(f"\nFound {len(markets)} markets:")
-        for i, market in enumerate(markets):
-            print(f"{i+1}. Question: {market['question']}")
-            print(f"   Slug: {market['market_slug']}")
+        print(f"\nFound {len(matching_markets)} matching markets:")
+        for i, market in enumerate(matching_markets):
+            print(f"{i+1}. {market['question']}")
+            
+            # Parse and print outcomes
+            try:
+                outcomes = json.loads(market['outcomes'])
+                prices = json.loads(market['outcomePrices'])
+                outcomes_str = ", ".join([f"{outcomes[j]} ({float(prices[j])*100:.0f}%)" for j in range(len(outcomes))])
+                print(f"   Outcomes: {outcomes_str}")
+            except:
+                pass
+            
+            # Print token ID
+            token_id = extract_token_id(market)
+            if token_id:
+                print(f"   Token ID: {token_id}")
+            
             print()
         
-        # Ask user to select a market
-        selected_idx = int(input("Enter the number of the market to view (0 to exit): ")) - 1
-        if selected_idx < 0 or selected_idx >= len(markets):
-            print("Exiting...")
-            return
-        
-        # Get and show odds for selected market
-        odds = get_market_odds(client, markets[selected_idx])
-        print("\nCurrent odds:")
-        print(odds)
-        return
-    
-    # File-based search mode
-    matches_file = sys.argv[1]
-    search_terms = read_matches_from_file(matches_file)
-    
-    if not search_terms:
-        print("No search terms found in the file or file is empty.")
-        return
-    
-    # Initialize the CLOB client
-    client = get_clob_client()
-    
-    # If term number provided, search for that specific term
-    if len(sys.argv) >= 3:
-        try:
-            term_idx = int(sys.argv[2]) - 1
-            if term_idx < 0 or term_idx >= len(search_terms):
-                print(f"Invalid term number. Please choose between 1 and {len(search_terms)}.")
-                return
-            
-            search_term = search_terms[term_idx]
-            print(f"Selected search term #{term_idx + 1}: {search_term}")
-            
-            # Search for markets
-            markets = search_by_market_slug(client, search_term)
-            
-            if not markets:
-                print(f"No markets found for: {search_term}")
-                return
-            
-            # Print found markets
-            print(f"\nFound {len(markets)} markets:")
-            for i, market in enumerate(markets):
-                print(f"{i+1}. Question: {market['question']}")
-                print(f"   Slug: {market['market_slug']}")
-                print()
-            
-            # If multiple markets found, ask user to select one
-            if len(markets) > 1:
+        # Select a market
+        if len(matching_markets) > 1:
+            try:
                 selected_idx = int(input("Enter the number of the market to view (0 to exit): ")) - 1
-                if selected_idx < 0 or selected_idx >= len(markets):
+                if selected_idx < 0 or selected_idx >= len(matching_markets):
                     print("Exiting...")
                     return
-            else:
-                selected_idx = 0
-            
-            # Get and show odds for selected market
-            odds = get_market_odds(client, markets[selected_idx])
-            print("\nCurrent odds:")
-            print(odds)
-            
-        except ValueError:
-            print("Term number must be an integer.")
-    else:
-        # List all search terms and let user choose
-        print("Available search terms:")
-        for i, term in enumerate(search_terms):
-            print(f"{i+1}. {term}")
+            except ValueError:
+                print("Invalid input. Exiting...")
+                return
+        else:
+            selected_idx = 0
         
-        try:
-            term_idx = int(input("Enter the number of the term to search for: ")) - 1
-            if term_idx < 0 or term_idx >= len(search_terms):
-                print(f"Invalid term number. Please choose between 1 and {len(search_terms)}.")
-                return
-            
-            search_term = search_terms[term_idx]
-            
-            # Search for markets
-            markets = search_by_market_slug(client, search_term)
-            
-            if not markets:
-                print(f"No markets found for: {search_term}")
-                return
-            
-            # Print found markets
-            print(f"\nFound {len(markets)} markets:")
-            for i, market in enumerate(markets):
-                print(f"{i+1}. Question: {market['question']}")
-                print(f"   Slug: {market['market_slug']}")
-                print()
-            
-            # If multiple markets found, ask user to select one
-            if len(markets) > 1:
-                selected_idx = int(input("Enter the number of the market to view (0 to exit): ")) - 1
-                if selected_idx < 0 or selected_idx >= len(markets):
-                    print("Exiting...")
-                    return
-            else:
-                selected_idx = 0
-            
-            # Get and show odds for selected market
-            odds = get_market_odds(client, markets[selected_idx])
-            print("\nCurrent odds:")
-            print(odds)
-            
-        except ValueError:
-            print("Term number must be an integer.")
+        # Initialize CLOB client and get market details
+        client = get_clob_client()
+        market_details = get_market_details(client, matching_markets[selected_idx])
+        
+        print("\nMarket Details:")
+        print(market_details)
+        
+        # Print direct Polymarket link
+        event_slug = matching_markets[selected_idx].get('eventSlug', '')
+        if event_slug:
+            print(f"\nDirect link: https://polymarket.com/event/{event_slug}")
 
 if __name__ == "__main__":
-    print("Cricket Odds Fetcher with Market Slug Search")
+    print("Improved Cricket Odds Fetcher for Polymarket")
     main()
