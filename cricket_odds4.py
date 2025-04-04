@@ -416,10 +416,35 @@ def main():
             
             # Display comprehensive information about the market
             print(f"Market ID: {selected_market['id']}")
-            token_id = extract_token_id(selected_market)
-            if token_id:
-                print(f"Token ID: {token_id}")
-            
+            # print(f"Info: {selected_market}")
+            # Get clobTokenIds and parse if necessary
+            clobTokenIds_raw = selected_market.get("clobTokenIds")
+            clobTokenIds = []
+            token_id_fallback = selected_market.get("conditionId") # Get fallback ID first
+
+            if clobTokenIds_raw:
+                if isinstance(clobTokenIds_raw, str):
+                    try:
+                        clobTokenIds = json.loads(clobTokenIds_raw)
+                        if not isinstance(clobTokenIds, list): # Ensure it parsed to a list
+                            print(f"Warning: Parsed clobTokenIds is not a list: {clobTokenIds}")
+                            clobTokenIds = [] # Reset if not a list
+                    except json.JSONDecodeError:
+                        print(f"Warning: Could not parse clobTokenIds JSON: {clobTokenIds_raw}")
+                elif isinstance(clobTokenIds_raw, list):
+                     clobTokenIds = clobTokenIds_raw
+                else:
+                    print(f"Warning: clobTokenIds is not a string or list: {type(clobTokenIds_raw)}")
+
+            # Print the IDs that will be used
+            print(f"DEBUG: clobTokenIds = {clobTokenIds}, type = {type(clobTokenIds)}") # Debug print added
+            if clobTokenIds:
+                 print(f"Using clobTokenIds: {clobTokenIds}")
+            elif token_id_fallback:
+                 print(f"Using conditionId as Token ID: {token_id_fallback}")
+            else:
+                 print("No Token ID or clobTokenIds found for this market.")
+
             # Display game start time with time elapsed
             if "gameStartTime" in selected_market and selected_market["gameStartTime"]:
                 try:
@@ -503,11 +528,39 @@ def main():
                 print(f"\nPolymarket link: https://polymarket.com/event/{event_slug}")
             
             # Try to get order book if token ID is available
-            if token_id:
+            if clobTokenIds and isinstance(clobTokenIds, list):
+                try:
+                    print("\nAttempting to fetch order book data for clobTokenIds...")
+                    for clobTokenId in clobTokenIds:
+                        print(f"Fetching order book for token ID: {clobTokenId}")
+                        order_book = client.get_order_book(clobTokenId)
+                        debug_print("Order book data:", order_book)
+
+                        if order_book:
+                            # Add bid and ask information
+                            if hasattr(order_book, 'bids') and order_book.bids:
+                                print("\nTop bids (BUY orders):")
+                                for i, bid in enumerate(order_book.bids[:3]):  # Show top 3 bids
+                                    print(f"  Price: ${bid.price} | Size: {bid.size}")
+                            else:
+                                print("\nNo bid orders found.")
+
+                            if hasattr(order_book, 'asks') and order_book.asks:
+                                print("\nTop asks (SELL orders):")
+                                for i, ask in enumerate(order_book.asks[:3]):  # Show top 3 asks
+                                    print(f"  Price: ${ask.price} | Size: {ask.size}")
+                            else:
+                                print("\nNo ask orders found.")
+                        else:
+                            print("\nNo order book data available.")
+                except Exception as e:
+                    print(f"\nCould not fetch order book: {e}")
+            elif token_id:
                 try:
                     print("\nAttempting to fetch order book data...")
                     order_book = client.get_order_book(token_id)
-                    
+                    debug_print("Order book data:", order_book)
+
                     if order_book:
                         # Add bid and ask information
                         if hasattr(order_book, 'bids') and order_book.bids:
@@ -516,7 +569,7 @@ def main():
                                 print(f"  Price: ${bid.price} | Size: {bid.size}")
                         else:
                             print("\nNo bid orders found.")
-                        
+
                         if hasattr(order_book, 'asks') and order_book.asks:
                             print("\nTop asks (SELL orders):")
                             for i, ask in enumerate(order_book.asks[:3]):  # Show top 3 asks
@@ -527,7 +580,6 @@ def main():
                         print("\nNo order book data available.")
                 except Exception as e:
                     print(f"\nCould not fetch order book: {e}")
-            
         except ValueError:
             print("Invalid input. Please enter a number.")
         except KeyboardInterrupt:
