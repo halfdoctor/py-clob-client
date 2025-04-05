@@ -322,6 +322,9 @@ def get_market_summary(market):
             except:
                 pass
         
+        if "slug" in market and market["slug"]:
+            summary += f"Slug: {market['slug']}\n"
+        
         # Add Polymarket link
         event_slug = market.get('eventSlug', '')
         if event_slug:
